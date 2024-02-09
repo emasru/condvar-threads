@@ -27,7 +27,7 @@ impl Worker {
             f();
         });
 
-        // Update the worker handle
+        // Update the worker handle, this does not block while thread is executing
         self.handle = Arc::new(Mutex::new(Some(handle)));
     }
 
