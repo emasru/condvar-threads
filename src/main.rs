@@ -1,14 +1,19 @@
-use std::{sync::{Arc, Mutex}, thread::{self, JoinHandle}};
+use std::{sync::{Arc, Mutex}, thread::{self, JoinHandle}, time::Duration};
 
 struct Worker {
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl Worker {
-    fn post<F>(&mut self, f: F)
+    fn post<F>(&mut self, f: F, ms: u64)
     where
         F: Fn() + Send + 'static, // Ensure F is Send and 'static
     {
+        // Condvars could have been used here
+        // But it is not required, as spawning a new thread in the event loop is blocked while waiting on .join()
+        // Instead, just put the thread to sleep before execution, when you spawn it.
+        // https://doc.rust-lang.org/std/sync/struct.Condvar.html
+
         // Join the previous handle, or wait until it is finished
         let handle = Arc::clone(&self.handle);
         let mut guard = handle.lock().unwrap();
@@ -18,11 +23,19 @@ impl Worker {
 
         // Spawn a new thread to execute the closure
         let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(ms));
             f();
         });
 
         // Update the worker handle
         self.handle = Arc::new(Mutex::new(Some(handle)));
+    }
+
+    pub fn join(&mut self) {
+        let mut guard = self.handle.lock().unwrap();
+        if let Some(handle) = guard.take() {
+            handle.join().unwrap();
+        }
     }
 }
 
@@ -50,7 +63,7 @@ impl Workers {
         Workers { workers, next_thread }
     }
 
-    fn post<F>(&mut self, f: F)
+    fn post_full<F>(&mut self, f: F, ms: u64)
     where
         F: Fn() + Send + 'static, 
     {
@@ -60,7 +73,7 @@ impl Workers {
         let mut next_thread = self.next_thread.lock().unwrap();
         // println!("next thread index to be executed is {}", next_thread);
         let worker = &mut self.workers[*next_thread];
-        worker.post(f);
+        worker.post(f, ms);
 
         // Increments or wraps around
         if self.workers.len()-1 == 0 {
@@ -76,14 +89,26 @@ impl Workers {
         // Lock releases when ref is dropped
     }
 
+    fn post<F>(&mut self, f: F)
+    where
+        F: Fn() + Send + 'static, 
+    {
+        self.post_full(f, 0)
+    }
+
+    fn post_timeout<F>(&mut self, f: F, ms: u64)
+    where
+        F: Fn() + Send + 'static, 
+    {
+        self.post_full(f, ms)
+    }
+
     fn join_all (self) {
-        for worker in self.workers {
-            let mut guard = worker.handle.lock().unwrap();
-            if let Some(handle) = guard.take() {
-                handle.join().unwrap();
-            }
+        for mut worker in self.workers {
+            worker.join();
         }
     }
+
 }
 
 fn main() {
