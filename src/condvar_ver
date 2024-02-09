@@ -1,0 +1,162 @@
+use std::{sync::{Arc, Condvar, Mutex}, thread::{self, JoinHandle}, time::Duration};
+
+struct Worker {
+    handle: Arc<(Mutex<Option<JoinHandle<()>>>, Condvar)>,
+}
+
+impl Worker {
+    fn post<F>(&mut self, f: F, ms: u64)
+    where
+        F: Fn() + Send + 'static, // Ensure F is Send and 'static
+    {
+        // Condvars could have been used here
+        // But it is not required, as spawning a new thread in the event loop is blocked while waiting on .join()
+        // Instead, just put the thread to sleep before execution, when you spawn it.
+        // https://doc.rust-lang.org/std/sync/struct.Condvar.html
+
+        // In new thread, wait until condvar is notified, so that we can begin new thread
+        
+        /* 
+        let handle = Arc::clone(&self.handle);
+        let mut guard = handle.lock().unwrap();
+        if let Some(handle) = guard.take() {
+            handle.join().unwrap();
+        } */
+
+        // Start a thread for checking for new handle, this one will then wait
+        let waiting_handle = Arc::clone(&self.handle);
+        thread::spawn(move || {
+            let (lock, cvar) = &*waiting_handle;
+            let mut handle = lock.lock().unwrap();
+            let mut guard = cvar.wait(handle).unwrap();
+
+            if let Some(handle) = guard.take() {
+                handle.join().unwrap();
+            }
+        });
+
+        // Redeclare
+        let waiting_handle = Arc::clone(&self.handle);
+        // Spawn a new thread to execute the closure, which notifies the handle checking thread
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(ms));
+
+            let (_lock, cvar) = &*waiting_handle;
+            cvar.notify_one();
+
+            f();
+        });
+
+    }
+
+    pub fn join(&mut self) {
+        let waiting_handle = Arc::clone(&self.handle);
+        let (lock, cvar) = &*waiting_handle;
+        let mut handle = lock.lock().unwrap();
+        // There may still be a thread lingering
+        cvar.notify_one();
+        let mut guard = cvar.wait(handle).unwrap();
+
+        if let Some(handle) = guard.take() {
+            handle.join().unwrap();
+        }
+    }
+}
+
+struct Workers {
+    workers: Vec<Worker>,
+    // Use an RR scheduling system
+    next_thread: Arc<Mutex<usize>>
+}
+
+impl Workers {
+    fn new(max_threads: usize) -> Workers {
+        let mut workers: Vec::<Worker> = Vec::new();
+        let next_thread = Arc::new(Mutex::new(0));
+        let handle = Arc::new((Mutex::new(None), Condvar::new()));
+        
+        for _ in 0..max_threads {
+            workers.push(Worker { handle: Arc::clone(&handle) })
+        }
+
+        /*
+        let watch_thread = thread::spawn(move || {
+            // Something to watch .-.
+        });
+        */
+
+        Workers { workers, next_thread }
+    }
+
+    fn post_full<F>(&mut self, f: F, ms: u64)
+    where
+        F: Fn() + Send + 'static, 
+    {
+        // println!("current number of workers is {}", self.workers.len());
+        
+        // Pick the next available thread
+        let mut next_thread = self.next_thread.lock().unwrap();
+        // println!("next thread index to be executed is {}", next_thread);
+        let worker = &mut self.workers[*next_thread];
+        worker.post(f, ms);
+
+        // Increments or wraps around
+        if self.workers.len()-1 == 0 {
+            *next_thread = 0;
+        } else if *next_thread < self.workers.len()-1 {
+            *next_thread += 1;
+        } else {
+            *next_thread = 0;
+        }
+
+        // println!("NOW next thread index to be executed is {}", next_thread);
+
+        // Lock releases when ref is dropped
+    }
+
+    fn post<F>(&mut self, f: F)
+    where
+        F: Fn() + Send + 'static, 
+    {
+        self.post_full(f, 0)
+    }
+
+    fn post_timeout<F>(&mut self, f: F, ms: u64)
+    where
+        F: Fn() + Send + 'static, 
+    {
+        self.post_full(f, ms)
+    }
+
+    fn join_all (self) {
+        for mut worker in self.workers {
+            worker.join();
+        }
+    }
+
+}
+
+fn main() {
+    let mut pool_w_threads = Workers::new(4);
+
+    for i in 0..8 {
+        pool_w_threads.post(move || {
+            println!("Executing job {} with 4 threads", i);
+        });
+    }
+
+    let mut pool_w_event_loop = Workers::new(1);
+
+    for i in 0..8 {
+        pool_w_event_loop.post(move || {
+            println!("Executing job {} with an event loop", i);
+        });
+    }
+
+    pool_w_threads.post_timeout(|| {
+        println!("Executing delayed job after 2 seconds");
+    }, 2000);
+
+    pool_w_threads.join_all();
+    pool_w_event_loop.join_all();
+}
